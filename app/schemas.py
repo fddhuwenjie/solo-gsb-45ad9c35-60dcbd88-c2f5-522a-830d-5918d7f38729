@@ -681,13 +681,88 @@ class SettlementBatchResponse(BaseModel):
         ..., description="本次提交成功后的新 revision（首次为 1，逐批加一）"
     )
     batch_amount: str = Field(
-        ..., description="本批金额：账期整体重算后累计金额 − 重算前累计金额，"
-        "两位小数（到分）"
+        ...,
+        description="本批金额：账期整体重算后累计金额 − 重算前累计金额，"
+        "两位小数（到分）",
     )
     total_energy: str = Field(..., description="账期全部批次的累计用量（精确值）")
     total_amount: str = Field(..., description="账期累计总额，两位小数（到分）")
     quote: QuoteResponse = Field(
         ..., description="账期全部区间合并后用计价引擎整体重算的完整报价"
+    )
+
+
+# ----------------------------------------------------------------- close
+
+
+class CycleCloseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    close_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="本次关账的唯一幂等键；同 close_id 同内容重放原快照，"
+        "同 close_id 换内容冲突",
+    )
+    expected_revision: int = Field(
+        ..., ge=0,
+        description="客户端已知的当前 revision；必须与账期当前 revision 一致"
+        "（关账不推进 revision）",
+    )
+    expected_total_amount: Decimal = Field(
+        ..., ge=0, allow_inf_nan=False, decimal_places=2,
+        description="客户端期望的账期累计总额（两位小数到分）；必须与服务端"
+        "全部批次重算的累计金额一致才允许关账",
+    )
+
+
+class CloseBatchOut(BaseModel):
+    revision: int = Field(..., description="该批成功后的账期 revision")
+    idempotency_key: str
+    content_digest: str = Field(..., description="该批区间内容的 SHA-256（十六进制）")
+    batch_energy: str = Field(..., description="该批用量（精确值）")
+    batch_amount: str = Field(..., description="该批金额，两位小数（到分）")
+    created_at: str
+
+
+class CloseIntervalOut(BaseModel):
+    seq: int = Field(..., description="账期内全局递增序号")
+    revision: int = Field(..., description="所属批次成功后的 revision")
+    start: str = Field(..., description="UTC 半开区间起点（Z 后缀）")
+    end: str = Field(..., description="UTC 半开区间终点（Z 后缀）")
+    timezone: str
+    energy: str = Field(..., description="该区间精确用量（未舍入）")
+
+
+class CycleCloseResponse(BaseModel):
+    cycle_id: str
+    close_id: str = Field(..., description="关账幂等键（请求回显）")
+    version: str
+    currency: str
+    energy_unit: str
+    revision: int = Field(
+        ..., description="关账冻结的账期 revision（与提交时的当前 revision 相同）"
+    )
+    status: str = Field(..., description="关账后账期状态，固定为 closed")
+    expected_total_amount: str = Field(
+        ..., description="请求声明并核对通过的期望总额（两位小数）"
+    )
+    total_energy: str = Field(..., description="全部批次累计用量（精确值）")
+    total_amount: str = Field(
+        ..., description="服务端重算的账期累计总额，两位小数（到分）"
+    )
+    content_digest: str = Field(
+        ..., description="关账请求内容（期望总额）的 SHA-256（十六进制）"
+    )
+    detail_digest: str = Field(
+        ..., description="关账明细（批次按 revision、区间按 UTC 端点稳定排序）"
+        "的 SHA-256（十六进制）；同一账期同一内容逐次关账必然相同"
+    )
+    created_at: str
+    batches: list[CloseBatchOut] = Field(
+        ..., description="关账时冻结的全部批次摘要，按 revision 稳定排序"
+    )
+    intervals: list[CloseIntervalOut] = Field(
+        ..., description="关账时冻结的全部 UTC 用量区间，按区间起点/终点稳定排序"
     )
 
 

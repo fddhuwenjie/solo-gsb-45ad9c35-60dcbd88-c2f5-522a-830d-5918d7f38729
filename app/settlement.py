@@ -19,6 +19,21 @@
 
 任何区间冲突、规则版本锁定冲突、规则缺口或计价失败都在事务提交前抛出，
 不会写入批次、幂等记录，也不会推进 revision。
+
+原子关账（:func:`close_cycle` / ``POST /cycles/{id}/close``）：
+
+1. 在**单个 SQLite 写事务**内重读账期 revision、全部批次、全部区间与
+   累计金额，并用计价引擎整体重算；revision 匹配且期望总额与重算累计
+   （到分）一致，才以条件写（``WHERE revision=:expected AND
+   status='open'``）把账期翻转为 ``closed``，同事务写入不可变关账快照。
+2. 快照明细按**批次 revision（id 兜底）、区间 UTC 起点/终点（seq 兜底）
+   稳定排序**后组成规范 JSON 取 SHA-256（``detail_digest``）；快照行
+   保存首次完整响应体，同 ``close_id`` 同内容重放逐字节返回，换内容
+   409 ``close_idempotency_conflict``，换 ``close_id`` 409
+   ``cycle_closed``。
+3. 关账后账期拒绝新批次（409 ``cycle_closed``，旧批次同键重放仍可读）；
+   并发的批次与关账由条件写 + SQLite 写锁互斥，只有一个生效，落败方
+   不写入任何数据。任何检查失败都在提交前回滚，账期保持开放。
 """
 from __future__ import annotations
 
@@ -35,6 +50,7 @@ from sqlalchemy.orm import Session
 from . import pricing
 from .database import (
     BillingCycle,
+    CycleClose,
     CycleInterval,
     UsageBatch,
     engine as default_engine,
@@ -156,6 +172,78 @@ def build_quote_response(version: LoadedVersion,
 # ------------------------------------------------------------------- errors
 
 
+class _BatchGuardFailed(Exception):
+    """批次提交的条件更新在写事务内落败（revision 被并发推进或账期被并发
+    关账）；由外层用只读新事务重查归类，调用方收到常规 409。"""
+
+
+def _cycle_closed(cycle: BillingCycle, *, close_id: str | None = None
+                  ) -> PricingError:
+    return PricingError(
+        f"账期 {cycle.cycle_id} 已关账（revision={cycle.revision}），"
+        "拒绝新批次与重复/冲突关账；关账快照不可变",
+        code="cycle_closed", status_code=409,
+        details={"cycle_id": cycle.cycle_id,
+                 "revision": cycle.revision,
+                 "close_id": close_id},
+    )
+
+
+def _close_not_found(cycle_id: str, close_id: str) -> PricingError:
+    return PricingError(
+        f"账期 {cycle_id} 不存在 close_id 为 {close_id!r} 的关账快照",
+        code="close_not_found", status_code=404,
+        details={"cycle_id": cycle_id, "close_id": close_id},
+    )
+
+
+def _close_amount_mismatch(cycle_id: str, expected: str,
+                           actual: Decimal) -> PricingError:
+    return PricingError(
+        f"账期 {cycle_id} 的 expected_total_amount={expected} 与服务端"
+        f"全部批次累计金额 {actual} 不一致，拒绝关账",
+        code="close_amount_mismatch", status_code=409,
+        details={"cycle_id": cycle_id,
+                 "expected_total_amount": expected,
+                 "actual_total_amount": str(actual.quantize(Q2))},
+    )
+
+
+def _close_content_conflict(cycle_id: str, close_id: str,
+                            existing_digest: str,
+                            received_digest: str) -> PricingError:
+    return PricingError(
+        f"账期 {cycle_id} 的 close_id {close_id!r} 已用于不同的关账内容"
+        "（同 close_id 重放必须携带相同的 expected_total_amount）",
+        code="close_idempotency_conflict", status_code=409,
+        details={"cycle_id": cycle_id, "close_id": close_id,
+                 "existing_digest": existing_digest,
+                 "received_digest": received_digest},
+    )
+
+
+def _close_id_in_use(close_id: str, other_cycle_id: str) -> PricingError:
+    return PricingError(
+        f"close_id {close_id!r} 已被另一个账期 {other_cycle_id} 的关账快照"
+        "占用；close_id 全局唯一",
+        code="close_id_in_use", status_code=409,
+        details={"close_id": close_id, "other_cycle_id": other_cycle_id},
+    )
+
+
+def _classify_batch_guard(eng, cycle_id: str, req: SettlementBatchRequest):
+    """条件更新落败后的只读归类：已关账 -> cycle_closed；否则按当前
+    revision 报 revision_conflict。绝不写入。"""
+    with Session(eng) as session:
+        cycle = session.get(BillingCycle, cycle_id)
+        if cycle is not None and cycle.status == "closed":
+            close = cycle.close
+            raise _cycle_closed(
+                cycle, close_id=close.close_id if close else None)
+        current = cycle.revision if cycle is not None else 0
+        raise _revision_conflict(cycle_id, req.expected_revision, current)
+
+
 def _revision_conflict(cycle_id: str, expected: int,
                        current: int) -> PricingError:
     return PricingError(
@@ -253,6 +341,10 @@ def submit_batch(cycle_id: str, req: SettlementBatchRequest, *,
         attempt += 1
         try:
             return _submit_once(eng, cycle_id, req, new_intervals, digest)
+        except _BatchGuardFailed:
+            # 条件更新落败：新事务只读重查，归类为关账拒绝 / revision 冲突，
+            # 失败路径本身不写任何数据。
+            return _classify_batch_guard(eng, cycle_id, req)
         except OperationalError as exc:  # SQLITE_BUSY same-revision race
             if attempt > _MAX_LOCK_RETRIES or not _is_lock_error(exc):
                 raise
@@ -296,6 +388,11 @@ def _submit_once(eng, cycle_id: str, req: SettlementBatchRequest,
                 if req.expected_revision != current_revision:
                     raise _revision_conflict(
                         cycle_id, req.expected_revision, current_revision)
+
+                # 已关账账期拒绝一切新批次（幂等键重放已在上面返回，走到这
+                # 里的一定是新键）；revision/金额快照均不可变。
+                if cycle is not None and cycle.status == "closed":
+                    raise _cycle_closed(cycle)
 
                 # 3) 规则版本：不存在 -> 404；首次提交锁定版本；后续批次
                 #    换版本 -> 409 version_locked。结构问题/规则缺口由下面
@@ -370,20 +467,23 @@ def _submit_once(eng, cycle_id: str, req: SettlementBatchRequest,
                     ))
                     session.flush()
                 else:
-                    # 条件推进 revision：仅当 revision 仍等于 expected 时
-                    # 生效；rowcount==0 即被并发同 revision 请求抢先。
+                    # 条件推进 revision：仅当 revision 仍等于 expected 且
+                    # 账期仍开放时生效；rowcount==0 即被并发同 revision 请求
+                    # 抢先，或并发关账已把 status 翻成 closed。
                     guarded = session.execute(
                         update(BillingCycle)
                         .where(BillingCycle.cycle_id == cycle_id,
-                               BillingCycle.revision == req.expected_revision)
+                               BillingCycle.revision == req.expected_revision,
+                               BillingCycle.status == "open")
                         .values(revision=new_revision,
                                 total_energy=str(result.total_energy),
                                 total_amount=str(new_total_amount),
                                 updated_at=now)
                     )
                     if guarded.rowcount != 1:
-                        raise _revision_conflict(
-                            cycle_id, req.expected_revision, current_revision)
+                        # 无法在此事务内可靠区分两类落败，交给只读重查归类，
+                        # 本事务随异常整体回滚。
+                        raise _BatchGuardFailed()
 
                 batch_row = UsageBatch(
                     cycle_id=cycle_id,
@@ -440,6 +540,10 @@ def _classify_integrity_error(eng, cycle_id, req, digest, exc):
                 cycle_id, req.idempotency_key, batch.content_digest, digest)
         cycle = session.get(BillingCycle, cycle_id)
         if cycle is not None:
+            if cycle.status == "closed":
+                close = cycle.close
+                raise _cycle_closed(
+                    cycle, close_id=close.close_id if close else None) from exc
             raise _revision_conflict(
                 cycle_id, req.expected_revision, cycle.revision) from exc
     raise exc
@@ -475,6 +579,11 @@ def get_cycle(cycle_id: str, *, engine=None) -> dict:
             "currency": version.currency,
             "energy_unit": version.energy_unit,
             "revision": cycle.revision,
+            "status": cycle.status,
+            "closed_at": cycle.closed_at,
+            "close": (
+                _close_summary(cycle.close) if cycle.close is not None else None
+            ),
             "total_energy": cycle.total_energy,
             "total_amount": str(Decimal(cycle.total_amount).quantize(Q2)),
             "created_at": cycle.created_at,
@@ -502,3 +611,377 @@ def get_cycle(cycle_id: str, *, engine=None) -> dict:
                 for r in intervals
             ],
         }
+
+
+# ---------------------------------------------------------------------- close
+
+
+@dataclass(frozen=True)
+class CloseResult:
+    body: dict
+    replayed: bool
+
+
+class _CloseGuardFailed(Exception):
+    """关账的条件翻转在写事务内落败（账期已被并发关账或 revision 已被并发
+    批次推进）；由外层用只读新事务重查归类。"""
+
+
+def _canon_amount(value: Decimal) -> str:
+    """金额/用量的规范写法：Decimal 去尾零后的普通十进制串（避免
+    1E+1 之类的指数形式），供稳定哈希与快照对齐。"""
+    return format(value.normalize(), "f")
+
+
+def _close_request_digest(version_code: str, revision: int,
+                          expected_total_amount: Decimal) -> str:
+    """关账请求内容摘要：锁定版本 + 冻结 revision + 期望总额。
+
+    ``close_id`` 是幂等键本身，刻意不参与内容摘要（与批次幂等摘要排除
+    idempotency_key 同理）；revision 参与摘要，使同一金额但针对不同
+    revision 的关账视为不同内容。
+    """
+    doc = {
+        "version": version_code,
+        "revision": revision,
+        "expected_total_amount": _canon_amount(
+            expected_total_amount.quantize(Q2)),
+    }
+    return hashlib.sha256(canonical_json(doc).encode("utf-8")).hexdigest()
+
+
+def _sorted_batches(session: Session, cycle_id: str):
+    # revision 单批唯一递增，主键 id 仅作并列时的稳定次序。
+    return session.scalars(
+        select(UsageBatch)
+        .where(UsageBatch.cycle_id == cycle_id)
+        .order_by(UsageBatch.revision, UsageBatch.id)
+    ).all()
+
+
+def _sorted_intervals(session: Session, cycle_id: str):
+    # 区间在账期内首尾相接/互不重叠；按 UTC 起点、终点、seq 稳定排序。
+    return session.scalars(
+        select(CycleInterval)
+        .where(CycleInterval.cycle_id == cycle_id)
+        .order_by(CycleInterval.start_utc, CycleInterval.end_utc,
+                  CycleInterval.seq)
+    ).all()
+
+
+def _detail_doc(version_code: str, revision: int, total_energy: Decimal,
+                total_amount: Decimal, batches, intervals) -> dict:
+    """关账明细规范化文档：批次按 revision、区间按 UTC 端点稳定排序后，
+    对其完整业务内容取 SHA-256。任何批次或区间细节漂移都会改变摘要。"""
+    return {
+        "version": version_code,
+        "revision": revision,
+        "total_energy": _canon_amount(total_energy),
+        "total_amount": _canon_amount(total_amount),
+        "batches": [
+            {
+                "revision": b.revision,
+                "idempotency_key": b.idempotency_key,
+                "version": b.version_code,
+                "content_digest": b.content_digest,
+                "batch_energy": _canon_amount(Decimal(b.batch_energy)),
+                "batch_amount": _canon_amount(Decimal(b.batch_amount)),
+            }
+            for b in batches
+        ],
+        "intervals": [
+            {
+                "seq": r.seq,
+                "revision": r.revision,
+                "start": r.start_utc,
+                "end": r.end_utc,
+                "timezone": r.timezone,
+                "energy": _canon_amount(Decimal(r.energy)),
+            }
+            for r in intervals
+        ],
+    }
+
+
+def _snapshot_body(cycle: BillingCycle, close_row: CycleClose,
+                   batches, intervals) -> dict:
+    """构造（并持久化）的不可变关账快照响应体；重放时逐字节返回。"""
+    return {
+        "cycle_id": cycle.cycle_id,
+        "close_id": close_row.close_id,
+        "version": cycle.version_code,
+        "currency": None,  # 由 close_cycle/get_close 用版本信息填充
+        "revision": close_row.revision,
+        "status": "closed",
+        "expected_total_amount": str(
+            Decimal(close_row.expected_total_amount).quantize(Q2)),
+        "total_energy": close_row.total_energy,
+        "total_amount": str(Decimal(close_row.total_amount).quantize(Q2)),
+        "content_digest": close_row.content_digest,
+        "detail_digest": close_row.detail_digest,
+        "created_at": close_row.created_at,
+        "batches": [
+            {
+                "revision": b.revision,
+                "idempotency_key": b.idempotency_key,
+                "content_digest": b.content_digest,
+                "batch_energy": b.batch_energy,
+                "batch_amount": str(Decimal(b.batch_amount).quantize(Q2)),
+                "created_at": b.created_at,
+            }
+            for b in batches
+        ],
+        "intervals": [
+            {
+                "seq": r.seq,
+                "revision": r.revision,
+                "start": r.start_utc,
+                "end": r.end_utc,
+                "timezone": r.timezone,
+                "energy": r.energy,
+            }
+            for r in intervals
+        ],
+    }
+
+
+def _with_version_fields(session: Session, body: dict) -> dict:
+    version = load_version(session, body["version"])
+    body["currency"] = version.currency
+    body["energy_unit"] = version.energy_unit
+    return body
+
+
+def close_cycle(cycle_id: str, req, *, engine=None) -> CloseResult:
+    """原子关账，返回 ``(快照响应体, 是否幂等重放)``。
+
+    在单个 SQLite 写事务内重读账期 revision、全部批次与累计金额：revision
+    匹配且期望金额与服务端重算累计一致，才把账期条件翻转为 ``closed`` 并
+    写入不可变关账快照。任何检查失败都在提交前抛出，账期保持开放、批次与
+    金额不变。``engine`` 可注入（测试用临时文件库）。
+    """
+    eng = engine or default_engine
+    expected_amount = req.expected_total_amount.quantize(Q2)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return _close_once(eng, cycle_id, req, expected_amount)
+        except _CloseGuardFailed:
+            return _classify_close_guard(eng, cycle_id, req, expected_amount)
+        except OperationalError as exc:  # SQLITE_BUSY 与批次/关账竞争
+            if attempt > _MAX_LOCK_RETRIES or not _is_lock_error(exc):
+                raise
+            # 新事务重读全部状态后从头再判。
+
+
+def _close_once(eng, cycle_id: str, req, expected_amount: Decimal
+                ) -> CloseResult:
+    with Session(eng) as session:
+        try:
+            with session.begin():
+                cycle = session.get(BillingCycle, cycle_id)
+                if cycle is None:
+                    raise PricingError(
+                        f"账期不存在: {cycle_id}",
+                        code="cycle_not_found", status_code=404,
+                        details={"cycle_id": cycle_id})
+
+                # 1) 已有关账快照：同 close_id 同内容重放；其余一律拒绝。
+                existing = session.get(CycleClose, cycle_id)
+                if existing is not None:
+                    digest = _close_request_digest(
+                        cycle.version_code, cycle.revision, expected_amount)
+                    if existing.close_id != req.close_id:
+                        raise _cycle_closed(cycle, close_id=existing.close_id)
+                    if existing.content_digest != digest:
+                        raise _close_content_conflict(
+                            cycle_id, existing.close_id,
+                            existing.content_digest, digest)
+                    body = _with_version_fields(
+                        session, json.loads(existing.snapshot_json))
+                    return CloseResult(body, True)
+
+                # 2) expected_revision 必须等于当前 revision（关账不推进
+                #    revision；revision 落后时，并发批次可能正在提交）。
+                if req.expected_revision != cycle.revision:
+                    raise _revision_conflict(
+                        cycle_id, req.expected_revision, cycle.revision)
+
+                # 3) 在同一事务内重读全部批次与区间并重算累计金额。
+                version = load_version(session, cycle.version_code)
+                batches = _sorted_batches(session, cycle_id)
+                intervals = _sorted_intervals(session, cycle_id)
+                payload = [
+                    _StoredIntervalPayload(
+                        _parse_z(r.start_utc), _parse_z(r.end_utc),
+                        r.timezone, Decimal(r.energy))
+                    for r in intervals
+                ]
+                result = pricing.quote(version, payload)
+                actual_total = result.total_amount
+
+                # 持久化的未舍入累计必须与重算一致（不一致即持久化状态
+                # 损坏，绝不在客户侧金额冲突的名义下静默关账）。
+                stored_total = Decimal(cycle.total_amount)
+                if stored_total != actual_total:
+                    raise PricingError(
+                        f"账期 {cycle_id} 的持久化累计金额 "
+                        f"{stored_total} 与重算金额 {actual_total} 不一致",
+                        code="cycle_state_inconsistent", status_code=500,
+                        details={"cycle_id": cycle_id,
+                                 "stored_total_amount": _canon_amount(
+                                     stored_total),
+                                 "recomputed_total_amount": _canon_amount(
+                                     actual_total)})
+                if result.total_energy != Decimal(cycle.total_energy):
+                    raise PricingError(
+                        f"账期 {cycle_id} 的持久化累计用量与重算结果不一致",
+                        code="cycle_state_inconsistent", status_code=500,
+                        details={"cycle_id": cycle_id,
+                                 "stored_total_energy": cycle.total_energy,
+                                 "recomputed_total_energy": _canon_amount(
+                                     result.total_energy)})
+
+                # 4) 期望总额（到分）必须与重算累计一致才允许关账。
+                if expected_amount != actual_total.quantize(
+                        Q2, rounding=ROUND_HALF_UP):
+                    raise _close_amount_mismatch(
+                        cycle_id, str(expected_amount), actual_total)
+
+                total_energy = result.total_energy
+                content_digest = _close_request_digest(
+                    cycle.version_code, cycle.revision, expected_amount)
+                detail_doc = _detail_doc(
+                    cycle.version_code, cycle.revision, total_energy,
+                    actual_total, batches, intervals)
+                detail_digest = hashlib.sha256(
+                    canonical_json(detail_doc).encode("utf-8")).hexdigest()
+                now = _now()
+
+                # 5) 先构造快照行（不立即 flush），再做条件翻转：只有
+                #    status 仍为 open 且 revision 仍等于 expected 时才生效。
+                close_row = CycleClose(
+                    cycle_id=cycle_id,
+                    close_id=req.close_id,
+                    revision=cycle.revision,
+                    expected_total_amount=str(expected_amount),
+                    content_digest=content_digest,
+                    detail_digest=detail_digest,
+                    total_energy=_canon_amount(total_energy),
+                    total_amount=_canon_amount(actual_total),
+                    snapshot_json="",  # 下方翻转成功后回填
+                    created_at=now,
+                )
+                session.add(close_row)
+                session.flush()  # 暴露 close_id 全局唯一冲突
+
+                guarded = session.execute(
+                    update(BillingCycle)
+                    .where(BillingCycle.cycle_id == cycle_id,
+                           BillingCycle.revision == req.expected_revision,
+                           BillingCycle.status == "open")
+                    .values(status="closed",
+                            closed_at=now,
+                            updated_at=now)
+                )
+                if guarded.rowcount != 1:
+                    # 并发关账或并发批次已抢先：只读重查归类，事务回滚。
+                    raise _CloseGuardFailed()
+
+                # 重新按稳定次序读取（当前事务内数据未变，次序与文档一致），
+                # 组装快照并回填 JSON；响应体与持久化快照逐字节同源。
+                body = _snapshot_body(
+                    cycle, close_row, batches, intervals)
+                body["currency"] = version.currency
+                body["energy_unit"] = version.energy_unit
+                close_row.snapshot_json = json.dumps(body, ensure_ascii=False)
+                return CloseResult(body, False)
+
+        except IntegrityError as exc:
+            # close_id 全局唯一冲突等：只读重查归类，绝不留下半成品。
+            return _classify_close_integrity_error(
+                eng, cycle_id, req, expected_amount, exc)
+
+
+def _classify_close_guard(eng, cycle_id, req, expected_amount) -> CloseResult:
+    with Session(eng) as session:
+        existing = session.get(CycleClose, cycle_id)
+        if existing is not None:
+            cycle = session.get(BillingCycle, cycle_id)
+            if existing.close_id == req.close_id:
+                digest = _close_request_digest(
+                    cycle.version_code, existing.revision, expected_amount)
+                if existing.content_digest == digest:
+                    return CloseResult(
+                        _with_version_fields(
+                            session, json.loads(existing.snapshot_json)),
+                        True)
+                raise _close_content_conflict(
+                    cycle_id, existing.close_id,
+                    existing.content_digest, digest)
+            raise _cycle_closed(cycle, close_id=existing.close_id)
+        cycle = session.get(BillingCycle, cycle_id)
+        if cycle is None:
+            raise PricingError(
+                f"账期不存在: {cycle_id}",
+                code="cycle_not_found", status_code=404,
+                details={"cycle_id": cycle_id})
+        raise _revision_conflict(
+            cycle_id, req.expected_revision, cycle.revision)
+
+
+def _classify_close_integrity_error(eng, cycle_id, req, expected_amount, exc):
+    with Session(eng) as session:
+        existing = session.get(CycleClose, cycle_id)
+        if existing is not None:
+            cycle = session.get(BillingCycle, cycle_id)
+            digest = _close_request_digest(
+                cycle.version_code, existing.revision, expected_amount)
+            if existing.close_id == req.close_id:
+                if existing.content_digest == digest:
+                    return CloseResult(
+                        _with_version_fields(
+                            session, json.loads(existing.snapshot_json)),
+                        True)
+                raise _close_content_conflict(
+                    cycle_id, existing.close_id,
+                    existing.content_digest, digest)
+            raise _cycle_closed(cycle, close_id=existing.close_id)
+        # 本账期尚无快照：冲突来自 close_id 被别的账期占用。
+        owner = session.scalar(
+            select(CycleClose).where(CycleClose.close_id == req.close_id))
+        if owner is not None:
+            raise _close_id_in_use(req.close_id, owner.cycle_id) from exc
+    raise exc
+
+
+def _close_summary(close_row: CycleClose) -> dict:
+    return {
+        "close_id": close_row.close_id,
+        "revision": close_row.revision,
+        "expected_total_amount": str(
+            Decimal(close_row.expected_total_amount).quantize(Q2)),
+        "detail_digest": close_row.detail_digest,
+        "created_at": close_row.created_at,
+    }
+
+
+def get_close(cycle_id: str, *, engine=None) -> dict:
+    """返回账期的不可变关账快照；账期或快照不存在均 404。"""
+    eng = engine or default_engine
+    with Session(eng) as session:
+        cycle = session.get(BillingCycle, cycle_id)
+        if cycle is None:
+            raise PricingError(
+                f"账期不存在: {cycle_id}",
+                code="cycle_not_found", status_code=404,
+                details={"cycle_id": cycle_id})
+        close_row = session.get(CycleClose, cycle_id)
+        if close_row is None:
+            raise PricingError(
+                f"账期 {cycle_id} 尚未关账",
+                code="close_not_found", status_code=404,
+                details={"cycle_id": cycle_id})
+        return _with_version_fields(
+            session, json.loads(close_row.snapshot_json))

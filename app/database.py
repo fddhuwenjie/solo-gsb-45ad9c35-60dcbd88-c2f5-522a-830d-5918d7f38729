@@ -175,6 +175,10 @@ class BillingCycle(Base):
     revision: Mapped[int] = mapped_column(Integer, default=0)
     total_energy: Mapped[str] = mapped_column(String(64), default="0")
     total_amount: Mapped[str] = mapped_column(Text, default="0")
+    # open=仍可提交新批次；closed=已原子关账，拒绝一切新批次与重复/冲突关账。
+    # status 的翻转与 cycle_closes 快照行在同一个写事务内提交。
+    status: Mapped[str] = mapped_column(String(8), default="open")
+    closed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
     created_at: Mapped[str] = mapped_column(String(40))
     updated_at: Mapped[str] = mapped_column(String(40))
 
@@ -183,6 +187,9 @@ class BillingCycle(Base):
     )
     intervals: Mapped[list["CycleInterval"]] = relationship(
         back_populates="cycle", cascade="all, delete-orphan"
+    )
+    close: Mapped["CycleClose | None"] = relationship(
+        back_populates="cycle", cascade="all, delete-orphan", uselist=False
     )
 
 
@@ -239,6 +246,39 @@ class CycleInterval(Base):
     cycle: Mapped[BillingCycle] = relationship(back_populates="intervals")
 
 
+class CycleClose(Base):
+    """不可变关账快照：每个账期至多一行（主键即 cycle_id）。
+
+    在关账写事务内、与账期 ``status -> closed`` 的条件翻转一起插入：
+    - 同 ``close_id`` 同内容重放时原样返回 ``snapshot_json``（200）；
+    - 同 ``close_id`` 不同 ``expected_total_amount`` -> 409 冲突；
+    - 已存在关账记录（换 ``close_id`` 或重复关账）-> 409 ``cycle_closed``。
+    ``content_digest`` 为请求内容（期望总额）摘要；``detail_digest`` 为
+    按批次 revision、区间 UTC 端点稳定排序后计算的明细 SHA-256，任何
+    细节漂移都会改变它。
+    """
+
+    __tablename__ = "cycle_closes"
+
+    cycle_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_cycles.cycle_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    close_id: Mapped[str] = mapped_column(
+        String(128), unique=True, index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer)  # 关账时账期冻结的 revision
+    expected_total_amount: Mapped[str] = mapped_column(Text)
+    content_digest: Mapped[str] = mapped_column(String(64))  # sha256 hex
+    detail_digest: Mapped[str] = mapped_column(String(64))  # sha256 hex
+    total_energy: Mapped[str] = mapped_column(String(64))
+    total_amount: Mapped[str] = mapped_column(Text)
+    snapshot_json: Mapped[str] = mapped_column(Text)  # 首次关账的完整响应体
+    created_at: Mapped[str] = mapped_column(String(40))
+
+    cycle: Mapped[BillingCycle] = relationship(back_populates="close")
+
+
 class DatabaseBackup(Base):
     """在线备份登记：backup_id -> 已发布备份文件的摘要元数据。
 
@@ -267,10 +307,35 @@ def init_db() -> None:
         if directory:
             os.makedirs(directory, exist_ok=True)
     Base.metadata.create_all(engine)
+    _migrate_billing_cycles_schema(engine)
     with Session(engine) as session:
         if session.scalar(select(TariffVersion)) is None:
             seed(session)
             session.commit()
+
+
+def _migrate_billing_cycles_schema(eng) -> None:
+    """给关账特性上线前已存在的 billing_cycles 表补上 status / closed_at。
+
+    ``CREATE TABLE`` 只在表缺失时建表，不会为旧表添加列；这里用
+    ``ALTER TABLE ADD COLUMN`` 幂等补齐（通过 pragma table_info 探测），
+    存量行回填为开放状态 ``open``，语义与建表默认值一致。
+    """
+    from sqlalchemy import text
+
+    with eng.begin() as conn:
+        cols = {row[1] for row in conn.execute(
+            text("PRAGMA table_info(billing_cycles)"))}
+        if cols and "status" not in cols:
+            conn.execute(text(
+                "ALTER TABLE billing_cycles "
+                "ADD COLUMN status VARCHAR(8) DEFAULT 'open'"))
+            conn.execute(text(
+                "UPDATE billing_cycles SET status = 'open' "
+                "WHERE status IS NULL"))
+        if cols and "closed_at" not in cols:
+            conn.execute(text(
+                "ALTER TABLE billing_cycles ADD COLUMN closed_at VARCHAR(40)"))
 
 
 # ---------------------------------------------------------------- seed data

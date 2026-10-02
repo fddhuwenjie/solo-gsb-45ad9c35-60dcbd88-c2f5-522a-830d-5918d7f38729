@@ -26,6 +26,8 @@ from .schemas import (
     BackupResponse,
     CostAllocationRequest,
     CostAllocationResponse,
+    CycleCloseRequest,
+    CycleCloseResponse,
     DemandAllocationOut,
     DemandChargeRequest,
     DemandChargeResponse,
@@ -242,9 +244,43 @@ def post_cycle_batch(cycle_id: str, req: SettlementBatchRequest,
 
 @app.get("/cycles/{cycle_id}", tags=["settlement"])
 def get_cycle(cycle_id: str):
-    """查看账期当前结算状态：revision、账期总量/总额、各批次摘要与全部
-    已合并的 UTC 用量区间（可用于重启后接续与对账）。"""
+    """查看账期当前结算状态：revision、状态（open/closed）、账期总量/总额、
+    各批次摘要与全部已合并的 UTC 用量区间（可用于重启后接续与对账）。"""
     return settlement.get_cycle(cycle_id)
+
+
+@app.post("/cycles/{cycle_id}/close", response_model=CycleCloseResponse,
+          status_code=201, tags=["settlement"])
+def post_cycle_close(cycle_id: str, req: CycleCloseRequest,
+                     response: Response):
+    """为已接收的账期提供**原子关账**。
+
+    在单个 SQLite 写事务内重新读取账期 revision、全部批次与累计金额：仅当
+    ``expected_revision`` 与当前 revision 一致、且全部批次重算的累计总额
+    等于 ``expected_total_amount`` 时，才把账期条件翻转为 ``closed`` 并写入
+    不可变关账快照；明细按批次 revision、区间 UTC 端点稳定排序后计算
+    SHA-256（``detail_digest``）。任何检查失败都在提交前抛出，账期保持
+    开放，金额与批次不变。
+
+    关账成功后拒绝新批次（409 ``cycle_closed``）与重复/冲突关账；同
+    ``close_id`` 同内容重放原快照（200），换内容 409
+    ``close_idempotency_conflict``，换 ``close_id`` 409 ``cycle_closed``。
+    并发的批次提交与关账只有一个生效（条件写 + SQLite 写锁）。快照可通过
+    ``GET /cycles/{cycle_id}/close`` 查询。
+    """
+    result = settlement.close_cycle(cycle_id, req)
+    if result.replayed:
+        response.status_code = 200
+    return result.body
+
+
+@app.get("/cycles/{cycle_id}/close", response_model=CycleCloseResponse,
+         tags=["settlement"])
+def get_cycle_close(cycle_id: str):
+    """查询账期的不可变关账快照（含冻结 revision、期望/实际总额、
+    detail_digest、全部批次与区间明细）；账期不存在 404 ``cycle_not_found``，
+    尚未关账 404 ``close_not_found``。"""
+    return settlement.get_close(cycle_id)
 
 
 @app.post("/usage-estimate", response_model=UsageEstimateResponse,
