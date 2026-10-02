@@ -49,8 +49,11 @@ SQLite 数据文件持久化在 Docker 卷 `tariff-data`（容器内 `/data/tari
   首次响应体），用于幂等重放与同 code 冲突检测。
 - `billing_cycles` / `usage_batches` / `cycle_intervals`：
   `POST /cycles/{id}/batches` 的账期累计状态（锁定的规则版本、当前
-  revision、未舍入累计金额）、每批幂等登记（幂等键、内容摘要、首次响应
-  体、本批金额）与已合并的 UTC 用量区间。
+  revision、未舍入累计金额、`open`/`closed` 状态）、每批幂等登记（幂等键、
+  内容摘要、首次响应体、本批金额）与已合并的 UTC 用量区间。
+- `cycle_closures`：`POST /cycles/{id}/close` 的**不可变关账快照**（唯一
+  close_id、关账时 revision/累计金额、按批次与区间稳定排序计算的明细
+  SHA-256、完整快照 JSON）；每个账期至多一行，关账后不可覆盖。
 - `database_backups`：`POST /backups/{id}` 的备份登记（backup_id、
   文件名、字节数、SHA-256、发布时间），用于幂等重放、不可覆盖判定与
   重启后的下载/核对；备份文件本身位于数据卷的 `backups/` 目录。
@@ -976,6 +979,111 @@ UTC 用量区间（带所属 revision、全局序号），用于重启后接续�
 curl -s localhost:8000/cycles/demo-2024-07
 ```
 
+### `POST /cycles/{cycle_id}/close`
+
+为**已接收的账期提供原子关账**。调用方提交 `close_id`、`expected_revision`
+与 `expected_total_amount`，服务在**一个 SQLite 写事务**内：
+
+1. 先按 `close_id` 判幂等（同 close_id 同内容重放原快照，HTTP **200**；
+   换内容或换账期 → **409 `close_conflict`**）；
+2. 重新读取账期：不存在 → **404 `cycle_not_found`**；已被其他 close_id
+   关账 → **409 `cycle_closed`**；
+3. 重新读取账期 **revision**、**全部批次与累计金额**：`revision` 不匹配
+   → **409 `revision_conflict`**；累计金额四舍五入到分后与
+   `expected_total_amount` 不一致 → **409 `total_amount_mismatch`**；
+4. 全部校验通过后把账期标记为 **`closed`**（**关账不推进 revision**），
+   按批次（`revision`）与区间（`revision, seq`）**稳定排序**构造明细文档
+   计算 **SHA-256**（`detail_digest`），并复用计价引擎对账期全部区间
+   整体重算，保存**自包含的不可变关账快照**。
+
+状态翻转使用条件更新 `WHERE status='open' AND revision=:expected`，因此
+**并发的批次提交与关账只有一个生效**：落败方在新事务里重读状态后得到
+409（`revision_conflict` / `cycle_closed`）。任何失败整笔回滚，账期状态、
+revision、批次与区间都**不发生变化**。
+
+承接上面两批示例（revision=2、累计 **18.60**，服务端口 **8000**）：
+
+```bash
+curl -s -X POST localhost:8000/cycles/demo-2024-07/close \
+  -H 'Content-Type: application/json' -d '{
+  "close_id": "close-2024-07-001",
+  "expected_revision": 2,
+  "expected_total_amount": "18.60"
+}'
+```
+
+首次关账返回 **201**：
+
+```json
+{
+  "close_id": "close-2024-07-001",
+  "cycle_id": "demo-2024-07",
+  "version": "us-ny-demo-v2024",
+  "currency": "USD",
+  "energy_unit": "kWh",
+  "revision": 2,
+  "total_energy": "120",
+  "total_amount": "18.60",
+  "detail_digest": "a3f1…9c",
+  "status": "closed",
+  "closed_at": "2026-10-02T08:00:00+00:00",
+  "batches": [
+    {"revision": 1, "idempotency_key": "batch-1",
+     "content_digest": "…", "batch_energy": "60",
+     "batch_amount": "9.00", "created_at": "…"},
+    {"revision": 2, "idempotency_key": "batch-2",
+     "content_digest": "…", "batch_energy": "60",
+     "batch_amount": "9.60", "created_at": "…"}
+  ],
+  "intervals": [
+    {"seq": 0, "revision": 1,
+     "start": "2024-07-06T04:00:00Z", "end": "2024-07-06T05:00:00Z",
+     "timezone": "America/New_York", "energy": "60"},
+    {"seq": 1, "revision": 2,
+     "start": "2024-07-06T05:00:00Z", "end": "2024-07-06T06:00:00Z",
+     "timezone": "America/New_York", "energy": "60"}
+  ],
+  "quote": { "total_energy": "120", "total_amount": "18.60",
+             "matched_rules": ["leisure"], "segments": ["…关账时整体重算…"] }
+}
+```
+
+字段说明：
+
+- `detail_digest`：对**批次列表（按 revision）与区间列表（按 revision、
+  seq）稳定排序**后的规范 JSON 取 SHA-256，涵盖账期/版本/revision、
+  累计总量总额、每批的幂等键/内容摘要/能量/金额与每段 UTC 区间。
+- `batches` / `intervals`：关账瞬间的全部批次与 UTC 区间（稳定排序），
+  与 `detail_digest` 覆盖的明细一致。
+- `quote`：关账事务内对账期**全部区间整体重算**的完整 `/quote` 报价，
+  快照因此完全自包含，可离线核对。
+
+**关账后的语义**：
+
+| 操作 | 结果 |
+| --- | --- |
+| 同 `close_id` 同内容（revision、金额、账期均一致）重放 | **200**，逐字节返回首次快照，不写库 |
+| 同 `close_id` 换内容（改 revision / 改金额 / 换账期） | **409 `close_conflict`**，`details` 给出首次与本次内容 |
+| 用**新 `close_id`** 再次关账 | **409 `cycle_closed`**（每账期至多一份快照） |
+| 关账后提交**新批次** | **409 `cycle_closed`**；账期与 revision 不变 |
+| 关账后**同 idempotency_key 同内容重放批次** | 仍按幂等返回首次批次响应（**200**），不产生新批次 |
+| `expected_revision` 过期 / 并发被抢先 | **409 `revision_conflict`** |
+| `expected_total_amount` 与账期累计金额不一致 | **409 `total_amount_mismatch`** |
+| 非法 `close_id`（如 `../x`、含空格） | **400 `invalid_close_id`** |
+
+### `GET /cycles/{cycle_id}/close`
+
+查询账期的**不可变关账快照**（响应体与首次关账**逐字节一致**）。账期不
+存在 → **404 `cycle_not_found`**；账期尚未关账 →
+**404 `closure_not_found`**。
+
+```bash
+curl -s localhost:8000/cycles/demo-2024-07/close
+```
+
+`GET /cycles/{cycle_id}` 的账期状态在关账后也会带 `"status": "closed"`、
+`closed_at` 与 `close_id` 字段。
+
 ### `POST /backups/{backup_id}`
 
 **服务不暂停**地导出可迁移的 SQLite 快照，供离线核对。调用方指定一个
@@ -1045,7 +1153,9 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | POST | `/cost-allocation` | 共享电表 2～6 个成员：UTC 端点原子段 + 按实际时长分摊合并，枚举全部联盟以 Shapley 值公平拆分阶梯电费，归属额严格合计为全体报价（见上） |
 | POST | `/usage-estimate` | 账单金额已知、用量缺失时反推用量区间：恒定功率假设 + 0.000001 网格 Decimal 二分定位目标金额平台两端，无解时区分超过可达上界与舍入跳跃（见上） |
 | POST | `/cycles/{cycle_id}/batches` | 账期分批用量的持久化增量结算：expected_revision 乐观锁 + 幂等重放、UTC 合并且禁重叠、账期整体重算让累计阶梯贯穿各批次（见上） |
-| GET | `/cycles/{cycle_id}` | 查看账期当前 revision、累计总量/总额、批次摘要与全部 UTC 区间（见上） |
+| GET | `/cycles/{cycle_id}` | 查看账期当前 revision、open/closed 状态、累计总量/总额、批次摘要与全部 UTC 区间（见上） |
+| POST | `/cycles/{cycle_id}/close` | 原子关账：单写事务重读 revision/全部批次/累计金额，revision 与金额都匹配才置 closed，按批次与区间稳定排序计算明细 SHA-256 并保存不可变快照；同 close_id 同内容重放、换内容冲突，并发批次与关账只有一个生效（见上） |
+| GET | `/cycles/{cycle_id}/close` | 查询不可变关账快照（账期不存在 404、未关账 404 closure_not_found；见上） |
 | POST | `/backups/{backup_id}` | 服务不暂停的在线 SQLite 快照：Online Backup API 分批复制、integrity_check、SHA-256/字节数、原子发布、幂等重放、不可覆盖（见上） |
 | GET | `/backups/{backup_id}` | 查询已发布备份的元数据（下载地址、摘要、字节数；见上） |
 | GET | `/backups/{backup_id}/download` | 下载已发布的自包含 SQLite 副本（见上） |
@@ -1071,10 +1181,15 @@ curl -s -X POST localhost:8000/backups/2026-10-01-recon
 | 409 | `tier_gap` | 阶梯上限不递增、中间档开放、最后一档封闭、无阶梯等 |
 | 409 | `rule_gap` | 报价区间内存在任何规则都不覆盖的时刻 |
 | 409 | `version_conflict` | `/versions/import` 的同 code 不同内容摘要，版本不可变，拒绝覆盖 |
-| 409 | `revision_conflict` | `/cycles/{id}/batches` 的 `expected_revision` 过期（首次非 0，或并发下账期已被其他请求推进）；同 revision 并发只有一个生效，落败方收到此码 |
+| 409 | `revision_conflict` | `/cycles/{id}/batches` 或 `/cycles/{id}/close` 的 `expected_revision` 过期（首次非 0、并发下账期已被其他请求推进，或批次/关账并发落败）；同 revision 并发只有一个生效，落败方收到此码 |
 | 409 | `idempotency_conflict` | 同一账期内幂等键已用于不同的提交内容（同键重放必须与首次完全一致） |
 | 409 | `version_locked` | 账期首次提交已锁定规则版本，后续批次提交了不同的 `version` |
-| 404 | `cycle_not_found` | `GET /cycles/{cycle_id}` 查询的账期不存在 |
+| 404 | `cycle_not_found` | `GET /cycles/{cycle_id}` 查询的账期不存在（关账/快照接口同样使用） |
+| 409 | `cycle_closed` | 账期已关账：用新 `close_id` 重复关账，或在关账后提交新批次（同 close_id 同内容仍重放、批次同键同内容仍幂等返回） |
+| 409 | `total_amount_mismatch` | 关账请求的 `expected_total_amount` 与事务中重读的账期累计金额（到分）不一致 |
+| 409 | `close_conflict` | 同一 `close_id` 已用于内容不同的关账（换 revision/金额/账期）；快照不可变，只能同内容重放 |
+| 400 | `invalid_close_id` | 关账 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`（含路径穿越尝试） |
+| 404 | `closure_not_found` | `GET /cycles/{cycle_id}/close` 查询的账期存在但尚未关账，没有快照 |
 | 400 | `invalid_backup_id` | 备份 ID 不符合 `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`（含路径穿越尝试） |
 | 404 | `backup_not_found` | 查询/下载一个尚未发布的备份 |
 | 410 | `backup_file_missing` | 有登记行但备份文件在数据卷上缺失（正常不会出现，重启清扫会移除该行） |
@@ -1131,7 +1246,7 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 181 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 205 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
@@ -1169,7 +1284,17 @@ SHA-256/字节数与实际文件一致、同 backup_id 重放返回首次元数�
 8 路并发只发布一个文件且无临时残留、备份进行中报价读与结算写持续
 成功（12 批全部提交、revision 12）、复制失败/integrity_check 失败
 删除临时文件且不留登记行、已有同名文件不可覆盖、非法 backup_id、
-重启后元数据/文件仍可下载与重放、启动清扫临时文件与孤儿登记行。
+重启后元数据/文件仍可下载与重放、启动清扫临时文件与孤儿登记行；
+**原子关账**（`tests/test_closing.py`，同样临时文件型 SQLite +
+真实写锁）覆盖单写事务内 revision/累计金额重读匹配才置 closed、
+按批次（revision）与区间（revision, seq）稳定排序的明细 SHA-256
+（重排行不改变摘要、批次内容不同摘要不同）、不可变快照逐字节重放、
+同 close_id 换 revision/金额/账期冲突、新 close_id 重复关账与关账后
+新批次被拒（同键批次重放仍返回首次响应）、revision/金额/账期不存在
+等失败路径不改变账期也不留快照、8 路不同 close_id 只有一份快照、
+8 路同 close_id 同内容全部拿到同一快照、4 路关账对 4 路批次只有一方
+生效且落败方收到对应 409、重启后快照可查/可重放/仍拒绝新批次，以及
+HTTP 端到端的 201/200/400/404/409 响应。
 
 ## 目录结构
 
@@ -1187,10 +1312,13 @@ app/
   importer.py   # 版本导入：规范化、SHA-256 摘要、定位校验、单事务落库
   settlement.py # 账期增量结算：幂等重放、expected_revision 乐观锁、
                 #   UTC 区间合并、账期整体重算、SQLite 持久化与重启接续
+  closing.py    # 原子关账：单写事务重读 revision/全部批次/累计金额，
+                #   条件置 closed、批次/区间稳定排序的明细 SHA-256、
+                #   不可变快照保存与同 close_id 幂等重放/冲突
   backup.py     # 在线快照：SQLite Online Backup API 独立连接分批复制、
                 #   integrity_check、SHA-256/字节数、原子发布、幂等与
                 #   不可覆盖、失败清理与启动清扫
-  database.py   # SQLAlchemy 模型（账期/批次/区间/备份表）与预置版本数据
+  database.py   # SQLAlchemy 模型（账期/批次/区间/关账/备份表）与预置版本数据
 tests/          # pytest 端到端测试
 Dockerfile
 docker-compose.yml

@@ -10,8 +10,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from . import (
-    allocation, backup, demand, diff, estimate, importer, meter, pricing,
-    settlement, shiftplan,
+    allocation, backup, closing, demand, diff, estimate, importer, meter,
+    pricing, settlement, shiftplan,
 )
 from .database import engine, init_db
 from .pricing import (
@@ -26,6 +26,8 @@ from .schemas import (
     BackupResponse,
     CostAllocationRequest,
     CostAllocationResponse,
+    CycleCloseRequest,
+    CycleCloseResponse,
     DemandAllocationOut,
     DemandChargeRequest,
     DemandChargeResponse,
@@ -245,6 +247,37 @@ def get_cycle(cycle_id: str):
     """查看账期当前结算状态：revision、账期总量/总额、各批次摘要与全部
     已合并的 UTC 用量区间（可用于重启后接续与对账）。"""
     return settlement.get_cycle(cycle_id)
+
+
+@app.post("/cycles/{cycle_id}/close", response_model=CycleCloseResponse,
+          status_code=201, tags=["settlement"])
+def post_cycle_close(cycle_id: str, req: CycleCloseRequest,
+                     response: Response):
+    """为已接收账期提供**原子关账**并保存不可变快照。
+
+    在单个 SQLite 写事务中重新读取账期 revision、全部批次与累计金额：
+    只有 ``expected_revision`` 匹配且累计金额（到分）与
+    ``expected_total_amount`` 一致，才把账期标记为 ``closed``，并按批次
+    （revision）与区间（revision, seq）稳定排序计算明细 SHA-256，保存
+    不可变关账快照。同 ``close_id`` 同内容重放原快照（200），换内容/换
+    账期冲突（409）；关账成功后批次接口拒绝新批次。并发批次与关账只有
+    一个生效；任何失败整笔回滚，不改变账期。
+    """
+    result = closing.close_cycle(cycle_id, req)
+    if result.replayed:
+        response.status_code = 200
+    return result.body
+
+
+@app.get("/cycles/{cycle_id}/close", response_model=CycleCloseResponse,
+         tags=["settlement"])
+def get_cycle_close(cycle_id: str):
+    """查询账期的不可变关账快照（含明细 SHA-256、批次/区间与整体重算报价）。
+
+    账期不存在返回 404 ``cycle_not_found``；账期尚未关账返回
+    404 ``closure_not_found``。
+    """
+    return closing.get_closure(cycle_id)
 
 
 @app.post("/usage-estimate", response_model=UsageEstimateResponse,

@@ -35,6 +35,7 @@ from sqlalchemy.orm import Session
 from . import pricing
 from .database import (
     BillingCycle,
+    CycleClosure,
     CycleInterval,
     UsageBatch,
     engine as default_engine,
@@ -192,6 +193,15 @@ def _idempotency_conflict(cycle_id: str, key: str, existing_digest: str,
     )
 
 
+def _cycle_closed(cycle_id: str) -> PricingError:
+    return PricingError(
+        f"账期 {cycle_id} 已关账，拒绝新批次（关账不可变；同 idempotency_key "
+        "同内容的重放仍返回首次响应）",
+        code="cycle_closed", status_code=409,
+        details={"cycle_id": cycle_id},
+    )
+
+
 def _overlap_error(cycle_id: str, a, b) -> PricingError:
     """合并去重后发现任意两段重叠时的 400；``a``/``b`` 为 CycleInterval
     行或本批 :class:`InputInterval`。"""
@@ -291,6 +301,10 @@ def _submit_once(eng, cycle_id: str, req: SettlementBatchRequest,
 
                 cycle = session.get(BillingCycle, cycle_id)
 
+                # 已关账账期拒绝新批次（幂等同键重放已在上面直接返回）。
+                if cycle is not None and cycle.status == "closed":
+                    raise _cycle_closed(cycle_id)
+
                 # 2) expected_revision 乐观锁检查（在幂等检查之后）。
                 current_revision = cycle.revision if cycle else 0
                 if req.expected_revision != current_revision:
@@ -370,11 +384,13 @@ def _submit_once(eng, cycle_id: str, req: SettlementBatchRequest,
                     ))
                     session.flush()
                 else:
-                    # 条件推进 revision：仅当 revision 仍等于 expected 时
-                    # 生效；rowcount==0 即被并发同 revision 请求抢先。
+                    # 条件推进 revision：仅当账期仍为 open 且 revision 仍等于
+                    # expected 时生效；rowcount==0 即被并发同 revision 请求或
+                    # 并发关账抢先。
                     guarded = session.execute(
                         update(BillingCycle)
                         .where(BillingCycle.cycle_id == cycle_id,
+                               BillingCycle.status == "open",
                                BillingCycle.revision == req.expected_revision)
                         .values(revision=new_revision,
                                 total_energy=str(result.total_energy),
@@ -382,8 +398,17 @@ def _submit_once(eng, cycle_id: str, req: SettlementBatchRequest,
                                 updated_at=now)
                     )
                     if guarded.rowcount != 1:
+                        refreshed = session.execute(
+                            select(BillingCycle)
+                            .where(BillingCycle.cycle_id == cycle_id)
+                            .execution_options(populate_existing=True)
+                        ).scalar_one()
+                        if refreshed.status == "closed":
+                            # 并发关账抢先生效：本批整体回滚，账期保持 closed。
+                            raise _cycle_closed(cycle_id)
                         raise _revision_conflict(
-                            cycle_id, req.expected_revision, current_revision)
+                            cycle_id, req.expected_revision,
+                            refreshed.revision)
 
                 batch_row = UsageBatch(
                     cycle_id=cycle_id,
@@ -439,6 +464,9 @@ def _classify_integrity_error(eng, cycle_id, req, digest, exc):
             raise _idempotency_conflict(
                 cycle_id, req.idempotency_key, batch.content_digest, digest)
         cycle = session.get(BillingCycle, cycle_id)
+        if cycle is not None and cycle.status == "closed":
+            # 并发关账抢先提交：本批落败，账期保持已关账状态。
+            raise _cycle_closed(cycle_id) from exc
         if cycle is not None:
             raise _revision_conflict(
                 cycle_id, req.expected_revision, cycle.revision) from exc
@@ -469,12 +497,18 @@ def get_cycle(cycle_id: str, *, engine=None) -> dict:
             .where(CycleInterval.cycle_id == cycle_id)
             .order_by(CycleInterval.seq)
         ).all()
+        closure = session.scalar(
+            select(CycleClosure).where(CycleClosure.cycle_id == cycle_id)
+        )
         return {
             "cycle_id": cycle.cycle_id,
             "version": cycle.version_code,
             "currency": version.currency,
             "energy_unit": version.energy_unit,
             "revision": cycle.revision,
+            "status": cycle.status,
+            "closed_at": cycle.closed_at,
+            "close_id": closure.close_id if closure is not None else None,
             "total_energy": cycle.total_energy,
             "total_amount": str(Decimal(cycle.total_amount).quantize(Q2)),
             "created_at": cycle.created_at,

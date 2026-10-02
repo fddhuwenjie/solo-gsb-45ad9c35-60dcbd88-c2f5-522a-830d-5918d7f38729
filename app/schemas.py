@@ -691,6 +691,70 @@ class SettlementBatchResponse(BaseModel):
     )
 
 
+# --------------------------------------------------------------- cycle close
+
+
+class CycleCloseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    close_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="唯一关账 ID（字母/数字开头，可含 _/-）；同 close_id "
+        "同内容重放原快照，换内容冲突",
+    )
+    expected_revision: int = Field(
+        ..., ge=0,
+        description="客户端已知的当前 revision；关账事务中重新读取比对，"
+        "不一致拒绝（409 revision_conflict）",
+    )
+    expected_total_amount: Decimal = Field(
+        ..., ge=0, allow_inf_nan=False, decimal_places=2,
+        description="客户端预期的账期累计总额（两位小数到分）；与重新读取"
+        "的累计金额不一致拒绝关账（409 total_amount_mismatch）",
+    )
+
+
+class ClosureBatchOut(BaseModel):
+    revision: int = Field(..., description="该批提交成功后的 revision")
+    idempotency_key: str
+    content_digest: str = Field(..., description="该批的幂等内容摘要（SHA-256）")
+    batch_energy: str
+    batch_amount: str = Field(..., description="该批金额（两位小数到分）")
+    created_at: str
+
+
+class ClosureIntervalOut(BaseModel):
+    seq: int = Field(..., description="区间在账期内的全局序号")
+    revision: int = Field(..., description="区间所属批次的 revision")
+    start: str = Field(..., description="UTC 半开区间起点（Z 后缀）")
+    end: str = Field(..., description="UTC 半开区间终点（Z 后缀）")
+    timezone: str
+    energy: str
+
+
+class CycleCloseResponse(BaseModel):
+    close_id: str = Field(..., description="关账 ID（请求体回显）")
+    cycle_id: str = Field(..., description="账期 ID（路径参数回显）")
+    version: str = Field(..., description="账期锁定的规则版本号")
+    currency: str
+    energy_unit: str
+    revision: int = Field(..., description="关账时账期的 revision（关账不推进）")
+    total_energy: str
+    total_amount: str = Field(..., description="关账时账期累计总额（两位小数）")
+    detail_digest: str = Field(
+        ..., description="按批次（revision）与区间（revision, seq）稳定排序"
+        "后的明细 SHA-256（十六进制）"
+    )
+    status: str = Field(..., description="关账后账期状态，固定为 closed")
+    closed_at: str = Field(..., description="关账时间（UTC ISO-8601）")
+    batches: list[ClosureBatchOut] = Field(
+        ..., description="快照中的全部批次（按 revision 稳定排序）")
+    intervals: list[ClosureIntervalOut] = Field(
+        ..., description="快照中的全部 UTC 区间（按 revision、seq 稳定排序）")
+    quote: QuoteResponse = Field(
+        ..., description="关账时对账期全部区间整体重算的完整报价")
+
+
 # ------------------------------------------------------------------ backup
 
 

@@ -12,7 +12,9 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
@@ -175,8 +177,13 @@ class BillingCycle(Base):
     revision: Mapped[int] = mapped_column(Integer, default=0)
     total_energy: Mapped[str] = mapped_column(String(64), default="0")
     total_amount: Mapped[str] = mapped_column(Text, default="0")
+    # open=仍可提交批次；closed=已原子关账，拒绝新批次与重复/冲突关账。
+    status: Mapped[str] = mapped_column(
+        String(8), default="open", server_default="open")
     created_at: Mapped[str] = mapped_column(String(40))
     updated_at: Mapped[str] = mapped_column(String(40))
+    # 关账后记录关账时间（开放账期为 NULL）。
+    closed_at: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     batches: Mapped[list["UsageBatch"]] = relationship(
         back_populates="cycle", cascade="all, delete-orphan"
@@ -239,6 +246,37 @@ class CycleInterval(Base):
     cycle: Mapped[BillingCycle] = relationship(back_populates="intervals")
 
 
+class CycleClosure(Base):
+    """账期的不可变关账快照（每个账期至多一行）。
+
+    关账在单个 SQLite 写事务内完成：重新读取账期 revision、全部批次与
+    累计金额，只有 ``expected_revision`` 匹配、``expected_total_amount``
+    一致才把账期置为 ``closed`` 并按批次/区间稳定排序计算明细 SHA-256，
+    把快照（``snapshot_json``）原样保存。``close_id`` 全局唯一：同
+    close_id 同内容重放原快照，换内容或换账期冲突；``cycle_id`` 的唯一
+    约束从库层面保证重复关账只能重放或冲突，不会产生第二份快照。
+    """
+
+    __tablename__ = "cycle_closures"
+    __table_args__ = (
+        UniqueConstraint("cycle_id", name="uq_cycle_closure_cycle"),
+    )
+
+    close_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    cycle_id: Mapped[str] = mapped_column(
+        ForeignKey("billing_cycles.cycle_id", ondelete="CASCADE"), index=True
+    )
+    revision: Mapped[int] = mapped_column(Integer)  # 关账时账期的 revision
+    expected_revision: Mapped[int] = mapped_column(Integer)
+    expected_total_amount: Mapped[str] = mapped_column(String(32))
+    total_energy: Mapped[str] = mapped_column(String(64))
+    total_amount: Mapped[str] = mapped_column(String(32))
+    # 按批次（revision）与区间（revision, seq）稳定排序后的明细 SHA-256。
+    detail_digest: Mapped[str] = mapped_column(String(64))
+    snapshot_json: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[str] = mapped_column(String(40))
+
+
 class DatabaseBackup(Base):
     """在线备份登记：backup_id -> 已发布备份文件的摘要元数据。
 
@@ -267,10 +305,28 @@ def init_db() -> None:
         if directory:
             os.makedirs(directory, exist_ok=True)
     Base.metadata.create_all(engine)
+    _migrate_cycle_columns(engine)
     with Session(engine) as session:
         if session.scalar(select(TariffVersion)) is None:
             seed(session)
             session.commit()
+
+
+def _migrate_cycle_columns(eng) -> None:
+    """给旧版卷中的 ``billing_cycles`` 补齐关账字段（保留 Compose 卷数据，
+    无需 ``docker compose down -v``）。新库由 ``create_all`` 直接建成。"""
+    inspector = inspect(eng)
+    if "billing_cycles" not in inspector.get_table_names():
+        return
+    existing = {col["name"] for col in inspector.get_columns("billing_cycles")}
+    with eng.begin() as conn:
+        if "status" not in existing:
+            conn.execute(text(
+                "ALTER TABLE billing_cycles "
+                "ADD COLUMN status VARCHAR(8) NOT NULL DEFAULT 'open'"))
+        if "closed_at" not in existing:
+            conn.execute(text(
+                "ALTER TABLE billing_cycles ADD COLUMN closed_at VARCHAR(40)"))
 
 
 # ---------------------------------------------------------------- seed data
